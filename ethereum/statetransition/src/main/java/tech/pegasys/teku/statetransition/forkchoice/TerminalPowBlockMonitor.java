@@ -36,6 +36,7 @@ import tech.pegasys.teku.storage.client.RecentChainData;
 
 public class TerminalPowBlockMonitor {
   private static final Logger LOG = LogManager.getLogger();
+  private static final int MAX_RECENT_BLOCKS = 5;
 
   private final EventLogger eventLogger;
   private final TimeProvider timeProvider;
@@ -48,9 +49,12 @@ public class TerminalPowBlockMonitor {
 
   private Optional<Bytes32> maybeBlockHashTracking = Optional.empty();
   private Optional<Bytes32> foundTerminalBlockHash = Optional.empty();
+  private Optional<PowBlock> previousBlock = Optional.empty();
+  private UInt256 averageBlockDifficulty = UInt256.valueOf(1);
   private SpecConfigBellatrix specConfigBellatrix;
   private boolean isBellatrixActive = false;
   private boolean inSync = true;
+  private boolean ttdEstimatorInitialised = false;
 
   public TerminalPowBlockMonitor(
       final ExecutionEngineChannel executionEngine,
@@ -212,6 +216,50 @@ public class TerminalPowBlockMonitor {
           .finish(
               error -> LOG.error("Unexpected error while searching Terminal Block by Hash", error));
     }
+  }
+
+  private void estimateTimeToTTD() {
+    executionEngine
+        .getPowChainHead()
+        .thenAccept(
+            powBlock -> {
+              if (previousBlock.isPresent()) {
+                UInt256 difficultyDifference =
+                    powBlock
+                        .getTotalDifficulty()
+                        .subtract(previousBlock.get().getTotalDifficulty());
+                if (ttdEstimatorInitialised) {
+                  averageBlockDifficulty =
+                      averageBlockDifficulty
+                          .subtract(averageBlockDifficulty.divide(MAX_RECENT_BLOCKS))
+                          .add(difficultyDifference.divide(MAX_RECENT_BLOCKS));
+                  UInt256 estimatedBlocksToTTD =
+                      specConfigBellatrix
+                          .getTerminalTotalDifficulty()
+                          .subtract(powBlock.getTotalDifficulty())
+                          .divide(averageBlockDifficulty);
+                  UInt64 estimatedBlockDuration =
+                      powBlock.getBlockTimestamp().minus(previousBlock.get().getBlockTimestamp());
+
+                  UInt256 estimatedSecondsToTTD =
+                      estimatedBlocksToTTD.multiply(
+                          UInt256.valueOf(estimatedBlockDuration.bigIntegerValue()));
+                  UInt256 daysToTTD = estimatedSecondsToTTD.divide(3600 * 24);
+                  UInt256 remainderHoursToTTD = estimatedBlocksToTTD.mod(3600 * 24).divide(3600);
+
+                  String ttdEstimateMessage =
+                      String.format(
+                          "estimateTimeToTTD: Approximately %s days and %s hours",
+                          daysToTTD.toString(), remainderHoursToTTD.toString());
+                  LOG.trace(ttdEstimateMessage);
+                } else {
+                  averageBlockDifficulty = difficultyDifference.multiply(MAX_RECENT_BLOCKS);
+                  ttdEstimatorInitialised = true;
+                }
+              }
+              previousBlock = Optional.of(powBlock);
+            })
+        .finish(error -> LOG.error("Unexpected error while checking TTD", error));
   }
 
   private void checkTerminalBlockByTTD() {
